@@ -119,13 +119,17 @@ async def get_favicon(soup, current_url):
     if favicon:
         if not favicon.startswith(('http://', 'https://')):
             # Se for relativo, torná-lo absoluto
-            favicon = urljoin(current_url, favicon)
+            if favicon.startswith("/"):
+                favicon = urljoin(current_url, favicon)
+            else:
+                favicon = urljoin(current_url, "/" + favicon)
         elif favicon.startswith("./") or favicon.startswith("/"):
             # Se começar com "./" ou "/", também torná-lo absoluto
             parsed_current_url = urlparse(current_url)
             favicon = parsed_current_url.scheme + "://" + parsed_current_url.netloc + favicon
 
     return favicon
+
 
 async def extract_sitemap_urls(sitemap_url):
     sitemap_urls = []
