@@ -4,6 +4,9 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
+import re
+import json
+import sys
 
 async def fetch_page(url, session):
     try:
@@ -51,6 +54,14 @@ async def extract_metadata(soup):
     except (TypeError, KeyError):
         metadata['favicon'] = ""
 
+    # Adicionar campos do OpenGraph
+    og_tags = soup.find_all('meta', attrs={'property': re.compile(r'^og:')})
+    og_metadata = {}
+    for tag in og_tags:
+        property_name = tag['property'][3:]  # Remover o prefixo "og:"
+        og_metadata[property_name] = tag['content']
+    metadata.update(og_metadata)
+
     return metadata
 
 async def extract_headings(soup):
@@ -87,8 +98,6 @@ async def extract_links(soup, current_url):
 
     return internal_links, external_links
 
-import re
-
 async def extract_body(soup):
     for script in soup(["script", "style"]):
         script.extract()
@@ -102,21 +111,21 @@ async def extract_body(soup):
     
     return text
 
-
 async def get_favicon(soup, current_url):
-    favicon = soup.find('link', attrs={'rel': 'icon'})['href'] if soup.find('link', attrs={'rel': 'icon'}) else ""
-    
+    favicon_tag = soup.find('link', attrs={'rel': 'icon'})
+    favicon = favicon_tag['href'] if favicon_tag else ""
+
     # Verificar se o favicon está faltando o domínio ou é relativo
-    if favicon and not favicon.startswith(('http://', 'https://')):
-        # Se for relativo, torná-lo absoluto
-        if favicon.startswith("./"):
-            favicon = urljoin(current_url, favicon[2:])
-        elif favicon.startswith("/"):
+    if favicon:
+        if not favicon.startswith(('http://', 'https://')):
+            # Se for relativo, torná-lo absoluto
+            favicon = urljoin(current_url, favicon)
+        elif favicon.startswith("./") or favicon.startswith("/"):
+            # Se começar com "./" ou "/", também torná-lo absoluto
             parsed_current_url = urlparse(current_url)
             favicon = parsed_current_url.scheme + "://" + parsed_current_url.netloc + favicon
-    
-    return favicon
 
+    return favicon
 
 async def extract_sitemap_urls(sitemap_url):
     sitemap_urls = []
@@ -156,6 +165,35 @@ async def check_sitemap(url):
 
     return sitemap_urls
 
+async def extract_schema(soup):
+    schemas = []
+
+    # Encontrar todas as tags <script> com o tipo de conteúdo 'application/ld+json'
+    script_tags = soup.find_all('script', type='application/ld+json')
+
+    # Iterar sobre todas as tags <script>
+    for script_tag in script_tags:
+        try:
+            # Analisar o conteúdo JSON dentro da tag <script>
+            schema_data = json.loads(script_tag.string)
+
+            # Verificar se o conteúdo JSON contém o campo '@type' (tipo do esquema)
+            if '@type' in schema_data:
+                schema = {}
+
+                # Extrair o tipo do esquema
+                schema['@type'] = schema_data['@type']
+
+                # Adicionar todas as outras propriedades do esquema, exceto '@context'
+                schema.update({key: value for key, value in schema_data.items() if key != '@context'})
+
+                # Adicionar o esquema à lista de esquemas
+                schemas.append(schema)
+        except Exception as e:
+            print("Error parsing schema:", e)
+
+    return schemas
+
 async def crawl(url):
     visited = set()
     results = []
@@ -176,11 +214,12 @@ async def crawl(url):
             body = await extract_body(soup)
             favicon = await get_favicon(soup, url)
             sitemap = await check_sitemap(url)
+            schemas = await extract_schema(soup)  # Extrair esquemas
 
             # Processar os links internos
             internal_links = internal_links or []  # Garante que internal_links seja uma lista
             for link in internal_links:
-                if link not in visited:
+                if link not in visited:  # Verificar se o link já foi visitado
                     visited.add(link)
                     queue.append(link)  # Adicionar os links internos à fila
 
@@ -198,7 +237,8 @@ async def crawl(url):
                     "links": {
                         "external": external_links  # Alteração aqui
                     },
-                    "body": body
+                    "body": body,
+                    "schemas": schemas  # Adicionar esquemas extraídos
                 }
             }
 
