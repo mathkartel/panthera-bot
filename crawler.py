@@ -1,6 +1,5 @@
 import asyncio
 import aiohttp
-import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
@@ -35,7 +34,7 @@ async def fetch_page(url, session):
 async def get_page(url, session):
     return await fetch_page(url, session)
 
-async def extract_metadata(soup):
+async def extract_metadata(current_url, soup):  
     metadata = {}
     metadata['title'] = soup.title.string.strip() if soup.title else ""
 
@@ -50,16 +49,29 @@ async def extract_metadata(soup):
         metadata['keywords'] = ""
 
     try:
-        metadata['favicon'] = soup.find('link', attrs={'rel': 'icon'})['href']
+        favicon_tag = soup.find('link', rel='icon')
+        favicon = favicon_tag['href'] if favicon_tag else ""
+        if favicon:
+            if not favicon.startswith(('http://', 'https://')):
+                if favicon.startswith("/"):
+                    favicon = urljoin(current_url, favicon)
+                else:
+                    favicon = urljoin(current_url, "/" + favicon)
+            elif favicon.startswith("./") or favicon.startswith("/"):
+                parsed_current_url = urlparse(current_url)
+                favicon = parsed_current_url.scheme + "://" + parsed_current_url.netloc + favicon
+        metadata['favicon'] = favicon
     except (TypeError, KeyError):
         metadata['favicon'] = ""
 
-    # Adicionar campos do OpenGraph
-    og_tags = soup.find_all('meta', attrs={'property': re.compile(r'^og:')})
     og_metadata = {}
+    og_tags = soup.find_all('meta', attrs={'property': re.compile(r'^og:')})
     for tag in og_tags:
-        property_name = tag['property'][3:]  # Remover o prefixo "og:"
-        og_metadata[property_name] = tag['content']
+        property_name = tag['property'][3:]
+        if 'content' in tag.attrs:
+            og_metadata[property_name] = tag['content']
+        else:
+            og_metadata[property_name] = ""
     metadata.update(og_metadata)
 
     return metadata
@@ -80,13 +92,30 @@ async def extract_links(soup, current_url):
 
     current_domain = urlparse(current_url).netloc
 
+    excluded_extensions = [
+        # Documentos
+        '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.txt',
+        # Imagens
+        '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tif', '.tiff',
+        # Mídias
+        '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm',
+        # Arquivos compactados
+        '.zip', '.rar', '.tar', '.gz',
+        # Arquivos de sistema
+        '.exe', '.dll', '.bat', '.sh', '.msi'
+    ]
+
     for link in soup.find_all('a', href=True):
         href = link['href']
         if href.startswith('tel:') or href.startswith('mailto:') or href.startswith('#'):
             continue
-        if not href.startswith('http'):
+        if not href.startswith(('http://', 'https://')):
             href = urljoin(current_url, href)
         parsed_href = urlparse(href)
+
+        if any(href.endswith(ext) for ext in excluded_extensions):
+            continue
+
         if parsed_href.scheme in ['http', 'https']:
             if parsed_href.netloc == current_domain:
                 internal_links.add(href)
@@ -102,34 +131,9 @@ async def extract_body(soup):
     for script in soup(["script", "style"]):
         script.extract()
     text = soup.get_text(separator=" ")
-    
-    # Remover caracteres de quebra de linha e espaços em branco extras
     text = re.sub(r'\s+', ' ', text)
-    
-    # Remover espaços extras no início e no final
     text = text.strip()
-    
     return text
-
-async def get_favicon(soup, current_url):
-    favicon_tag = soup.find('link', attrs={'rel': 'icon'})
-    favicon = favicon_tag['href'] if favicon_tag else ""
-
-    # Verificar se o favicon está faltando o domínio ou é relativo
-    if favicon:
-        if not favicon.startswith(('http://', 'https://')):
-            # Se for relativo, torná-lo absoluto
-            if favicon.startswith("/"):
-                favicon = urljoin(current_url, favicon)
-            else:
-                favicon = urljoin(current_url, "/" + favicon)
-        elif favicon.startswith("./") or favicon.startswith("/"):
-            # Se começar com "./" ou "/", também torná-lo absoluto
-            parsed_current_url = urlparse(current_url)
-            favicon = parsed_current_url.scheme + "://" + parsed_current_url.netloc + favicon
-
-    return favicon
-
 
 async def extract_sitemap_urls(sitemap_url):
     sitemap_urls = []
@@ -172,26 +176,19 @@ async def check_sitemap(url):
 async def extract_schema(soup):
     schemas = []
 
-    # Encontrar todas as tags <script> com o tipo de conteúdo 'application/ld+json'
     script_tags = soup.find_all('script', type='application/ld+json')
 
-    # Iterar sobre todas as tags <script>
     for script_tag in script_tags:
         try:
-            # Analisar o conteúdo JSON dentro da tag <script>
+            # Vamos imprimir o conteúdo do script para debug
+            print("Script content:", script_tag.string)
+
             schema_data = json.loads(script_tag.string)
 
-            # Verificar se o conteúdo JSON contém o campo '@type' (tipo do esquema)
             if '@type' in schema_data:
                 schema = {}
-
-                # Extrair o tipo do esquema
                 schema['@type'] = schema_data['@type']
-
-                # Adicionar todas as outras propriedades do esquema, exceto '@context'
                 schema.update({key: value for key, value in schema_data.items() if key != '@context'})
-
-                # Adicionar o esquema à lista de esquemas
                 schemas.append(schema)
         except Exception as e:
             print("Error parsing schema:", e)
@@ -212,13 +209,11 @@ async def crawl(url):
         if page_content:
             soup = BeautifulSoup(page_content, 'html.parser')
 
-            metadata = await extract_metadata(soup)
+            metadata = await extract_metadata(url, soup)  # Passar current_url como parâmetro
             headings = await extract_headings(soup)
             internal_links, external_links = await extract_links(soup, url)  # Alteração aqui
             body = await extract_body(soup)
-            favicon = await get_favicon(soup, url)
             sitemap = await check_sitemap(url)
-            schemas = await extract_schema(soup)  # Extrair esquemas
 
             # Processar os links internos
             internal_links = internal_links or []  # Garante que internal_links seja uma lista
@@ -226,6 +221,9 @@ async def crawl(url):
                 if link not in visited:  # Verificar se o link já foi visitado
                     visited.add(link)
                     queue.append(link)  # Adicionar os links internos à fila
+
+            # Extrair esquemas após todas as outras extrações de dados
+            schemas = await extract_schema(soup)
 
             result = {
                 "crawlInformation": {
@@ -248,7 +246,7 @@ async def crawl(url):
 
             results.append(result)
 
-    return results, internal_links  # Retorna os resultados e os links internos
+    return results, internal_links  # Retorna os resultados e os links internos 
 
 async def main():
     if len(sys.argv) != 2:
@@ -268,17 +266,12 @@ async def main():
         visited.add(current_url)
         print("Crawling:", current_url)
 
-        # Check sitemap and add URLs to queue
         sitemap_urls = await check_sitemap(current_url)
         queue.extend(sitemap_urls)
 
-        # Crawl the current URL
         results = await crawl(current_url)
 
-        # Process results and continue crawling
         for result in results:
-            # Send results to MeiliSearch
-            # Extract internal links and add them to the queue
             for link in result['pageStructure']['links']:
                 if link not in visited:
                     queue.append(link)

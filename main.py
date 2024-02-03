@@ -26,11 +26,23 @@ async def check_existing_url(url):
 
             # Verifica se o URL retornado é igual ao URL atual
             if existing_url == url:
-                # Verificar se o primeiro rastreamento ocorreu há menos de um mês
-                first_crawl = datetime.strptime(data[0]["crawlInformation"]["firstCrawl"], "%Y-%m-%d %H:%M:%S")
-                if datetime.now() - first_crawl < timedelta(days=30):
-                    # Retorna "skip" e o UID do documento
-                    return "skip", data[0]["uid"]
+                first_crawl = data[0]["crawlInformation"].get("firstCrawl")
+                last_crawl = data[0]["crawlInformation"].get("lastCrawl")
+
+                # Se houver apenas o firstCrawl e tiver mais de 30 dias, atualiza o documento
+                if first_crawl and not last_crawl:
+                    first_crawl_date = datetime.strptime(first_crawl, "%Y-%m-%d %H:%M:%S")
+                    if datetime.now() - first_crawl_date > timedelta(days=30):
+                        return "update", data[0]["uid"]
+                
+                # Se houver lastCrawl e tiver mais de 30 dias desde o último crawl, atualiza o documento
+                if last_crawl:
+                    last_crawl_date = datetime.strptime(last_crawl, "%Y-%m-%d %H:%M:%S")
+                    if datetime.now() - last_crawl_date > timedelta(days=30):
+                        return "update", data[0]["uid"]
+
+                # Se não precisar atualizar, retorna "skip" e o UID do documento
+                return "skip", None
 
         # Se não houver resultados ou o URL não corresponder, retorna "crawl"
         return "crawl", None
@@ -38,7 +50,6 @@ async def check_existing_url(url):
     except Exception as e:
         print("Error checking existing URL in MeiliSearch:", e)
         return "crawl", None
-
 
 async def main():
     if len(sys.argv) < 2:
@@ -50,72 +61,72 @@ async def main():
     queue = urls
 
     while queue:
-        current_url = queue.pop(0)
+        # Limitar o número de tarefas executadas simultaneamente para 5
+        tasks = [crawl(url) for url in queue[:5]]
+        queue = queue[5:]  # Remover os URLs da fila que estão sendo processados agora
 
-        if current_url in visited:
-            continue
+        # Executar as tarefas simultaneamente
+        results = await asyncio.gather(*tasks)
 
-        visited.add(current_url)
-        print("Crawling:", current_url)
+        # Processar os resultados
+        for result in results:
+            crawl_result, internal_links = result
 
-        # Verificar se o URL está na base de dados do MeiliSearch
-        action, existing_uid = await check_existing_url(current_url)
+            if not crawl_result:
+                continue
 
-        if action == "skip":
-            # Pular o URL, pois já foi rastreado recentemente
-            print("Skipping URL as it was crawled recently:", current_url)
-        elif action == "update" and existing_uid:
-            # Atualizar o URL existente
-            print("Updating existing URL:", current_url)
-            # Crawl the current URL
-            results, internal_links = await crawl(current_url)  # Alteração aqui
+            current_url = crawl_result[0]["pageStructure"]["url"]
 
-            # Extract internal links and add them to the queue for processing
-            for result in results:
-                for link in internal_links:
-                    if link not in visited:
-                        queue.append(link)
+            if current_url in visited:
+                continue
 
-            # Obter o documento existente pelo UID
-            existing_document = index.get_document(existing_uid)
-            # Atualizar os dados do documento existente com os novos dados do rastreamento
-            updated_document = {
-                "uid": existing_uid,
-                "crawlInformation": {
-                    "firstCrawl": existing_document["crawlInformation"]["firstCrawl"],
-                    "lastUpdate": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                },
-                "pageMetadata": result["pageMetadata"],
-                "pageStructure": result["pageStructure"]
-            }
-            # Atualizar o documento no MeiliSearch
-            try:
-                index.update_document(updated_document)
-                print("Existing URL updated in MeiliSearch successfully.")
-            except Exception as e:
-                print("Error updating existing URL in MeiliSearch:", e)
-        else:
-            # Crawl the current URL
-            results, internal_links = await crawl(current_url)  # Alteração aqui
+            visited.add(current_url)
+            print("Crawling:", current_url)
 
-            # Send results to MeiliSearch
-            for result in results:
-                result['uid'] = str(uuid.uuid4())  # Generating a unique UID for each document
+            # Verificar se o URL está na base de dados do MeiliSearch
+            action, existing_uid = await check_existing_url(current_url)
+
+            if action == "skip":
+                # Pular o URL, pois já foi rastreado recentemente ou não precisa ser atualizado
+                print("Skipping URL:", current_url)
+            elif action == "update" and existing_uid:
+                # Atualizar o URL existente
+                print("Updating existing URL:", current_url)
+
+                # Remover o documento existente no MeiliSearch
                 try:
-                    index.add_documents([result])
-                    print("Crawl result sent to MeiliSearch successfully.")
+                    index.delete_document(existing_uid)
+                    print("Existing URL removed from MeiliSearch successfully.")
                 except Exception as e:
-                    print("Error sending crawl result to MeiliSearch:", e)
+                    print("Error removing existing URL from MeiliSearch:", e)
+
+                # Adicionar o novo documento atualizado
+                for crawl_result_item in crawl_result:
+                    crawl_result_item['uid'] = existing_uid
+                    try:
+                        index.add_documents([crawl_result_item])
+                        print("Updated crawl result sent to MeiliSearch successfully.")
+                    except Exception as e:
+                        print("Error sending updated crawl result to MeiliSearch:", e)
+            else:
+                # Enviar os resultados para o MeiliSearch
+                for crawl_result_item in crawl_result:
+                    crawl_result_item['uid'] = str(uuid.uuid4())  # Generating a unique UID for each document
+                    try:
+                        index.add_documents([crawl_result_item])
+                        print("Crawl result sent to MeiliSearch successfully.")
+                    except Exception as e:
+                        print("Error sending crawl result to MeiliSearch:", e)
 
                 # Extract internal links and add them to the queue for processing
                 for link in internal_links:
                     if link not in visited:
                         queue.append(link)
 
-        # Exibir os próximos 10 URLs na fila
-        print("Next URLs in queue:")
-        for i, next_url in enumerate(queue[:10], start=1):
-            print(f"{i}. {next_url}")
+            # Exibir os próximos 10 URLs na fila
+            print("Next URLs in queue:")
+            for i, next_url in enumerate(queue[:10], start=1):
+                print(f"{i}. {next_url}")
 
 if __name__ == "__main__":
     asyncio.run(main())
